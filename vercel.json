@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "functions": {
+    "app/api/mcp/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "app/api/github-webhook/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "app/api/admin/refresh/route.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    },
+    "app/api/health/route.ts": {
+      "maxDuration": 10,
+      "memory": 512
+    }
+  }
+}

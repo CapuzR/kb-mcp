@@ -1,0 +1,41 @@
+# deps
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+build/
+dist/
+
+# Vercel
+.vercel
+
+# env
+.env
+.env*.local
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# testing
+coverage/
+.vitest-cache/
+
+# misc
+.DS_Store
+*.pem
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# local vault cache (never commit)
+.vault-cache/
+/tmp/moltbank-kb/

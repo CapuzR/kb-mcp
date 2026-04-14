@@ -5,14 +5,26 @@ import { enforceRateLimit } from '@/auth/rate-limit';
 import { buildMcpServerForCaller } from '@/mcp/server';
 import { AppError, RateLimitedError, UnauthorizedError } from '@/errors';
 import { logError, logInfo } from '@/logging';
+import { getBaseUrl } from '@/auth/urls';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+const CORS_HEADERS: Record<string, string> = {
+  'access-control-allow-origin': '*',
+  'access-control-expose-headers': 'Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate',
+};
+
+function withCors(res: Response): Response {
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 function jsonRpcError(status: number, code: number, message: string): Response {
   return new Response(
     JSON.stringify({ jsonrpc: '2.0', error: { code, message }, id: null }),
-    { status, headers: { 'content-type': 'application/json' } }
+    { status, headers: { 'content-type': 'application/json', ...CORS_HEADERS } }
   );
 }
 
@@ -29,11 +41,18 @@ async function handle(req: NextRequest): Promise<Response> {
         path: '/api/mcp',
         reason: err.message,
       });
+      // Point OAuth-capable clients at our discovery metadata so they can
+      // run the authorization flow (RFC 9728 §5.1).
+      const base = getBaseUrl(req);
+      const wwwAuth =
+        `Bearer realm="moltbank-kb-mcp", ` +
+        `resource_metadata="${base}/.well-known/oauth-protected-resource"`;
       return new Response(JSON.stringify({ error: err.message }), {
         status: 401,
         headers: {
           'content-type': 'application/json',
-          'www-authenticate': 'Bearer realm="moltbank-kb-mcp"',
+          'www-authenticate': wwwAuth,
+          ...CORS_HEADERS,
         },
       });
     }
@@ -52,6 +71,7 @@ async function handle(req: NextRequest): Promise<Response> {
           headers: {
             'content-type': 'application/json',
             'retry-after': String(Math.ceil(err.retryAfterMs / 1000)),
+            ...CORS_HEADERS,
           },
         }
       );
@@ -75,7 +95,7 @@ async function handle(req: NextRequest): Promise<Response> {
         extra: { consumer: caller.consumer },
       },
     });
-    return response;
+    return withCors(response);
   } catch (err) {
     const msg = err instanceof AppError ? err.message : 'Internal error';
     const status = err instanceof AppError ? err.status : 500;
@@ -99,4 +119,19 @@ export async function GET(): Promise<Response> {
 
 export async function DELETE(): Promise<Response> {
   return jsonRpcError(405, -32000, 'Method not allowed.');
+}
+
+// CORS preflight — required so browser-based MCP clients (Claude.ai) can call
+// POST /api/mcp with the Authorization header cross-origin.
+export async function OPTIONS(): Promise<Response> {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      'access-control-allow-origin': '*',
+      'access-control-allow-methods': 'POST, OPTIONS',
+      'access-control-allow-headers': 'Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID',
+      'access-control-expose-headers': 'Mcp-Session-Id, Mcp-Protocol-Version, WWW-Authenticate',
+      'access-control-max-age': '86400',
+    },
+  });
 }

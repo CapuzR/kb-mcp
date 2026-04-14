@@ -1,13 +1,15 @@
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
-import simpleGit, { SimpleGit } from 'simple-git';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGunzip } from 'node:zlib';
+import * as tar from 'tar';
 import { buildIndex } from './index';
 import { VaultIndex } from './types';
 import { logError, logInfo } from '../logging';
 
 /**
- * Where on disk we keep the clone. On Vercel only `/tmp` is writable, so we
- * default there; in local dev you can point VAULT_CACHE_DIR anywhere.
+ * Where on disk we keep the extracted vault. On Vercel only `/tmp` is writable,
+ * so we default there; in local dev you can point VAULT_CACHE_DIR anywhere.
  */
 function cacheDir(): string {
   return process.env.VAULT_CACHE_DIR || '/tmp/moltbank-kb';
@@ -27,16 +29,9 @@ function ttlSeconds(): number {
 }
 
 /**
- * Get an HTTPS URL with an auth token embedded. Prefer GitHub App installation
- * token, fall back to a PAT in GITHUB_TOKEN.
+ * Mint a short-lived installation token from a GitHub App, or fall back to a
+ * PAT in GITHUB_TOKEN. Called fresh on every sync so tokens never age out.
  */
-async function getAuthedCloneUrl(): Promise<string> {
-  const slug = repoSlug();
-  const token = await resolveAuthToken();
-  // x-access-token is the convention for app install tokens; works for PATs too
-  return `https://x-access-token:${encodeURIComponent(token)}@github.com/${slug}.git`;
-}
-
 async function resolveAuthToken(): Promise<string> {
   const appId = process.env.GITHUB_APP_ID;
   const instId = process.env.GITHUB_APP_INSTALLATION_ID;
@@ -59,23 +54,8 @@ async function resolveAuthToken(): Promise<string> {
   );
 }
 
-async function exists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export interface SyncResult {
-  index: VaultIndex;
-  /** true if we re-fetched from GitHub this call */
-  refetched: boolean;
-}
-
 export interface VaultManagerOptions {
-  /** override the clone/pull implementation (for tests) */
+  /** override the fetch-and-extract implementation (for tests) */
   cloneOrPull?: (destAbs: string) => Promise<string>;
   /** override the indexer */
   builder?: (destAbs: string, sha: string) => Promise<VaultIndex>;
@@ -84,8 +64,8 @@ export interface VaultManagerOptions {
 /**
  * Singleton vault manager. One per process; Vercel lambdas get their own.
  *
- * - cold start → clone
- * - webhook refresh / admin refresh / TTL expiry → pull
+ * - cold start → fetch tarball + extract
+ * - webhook refresh / admin refresh / TTL expiry → fetch again
  * - every other request → serve from memory
  */
 class VaultManager {
@@ -95,7 +75,7 @@ class VaultManager {
   private builder: (destAbs: string, sha: string) => Promise<VaultIndex>;
 
   constructor(opts: VaultManagerOptions = {}) {
-    this.cloneOrPull = opts.cloneOrPull ?? defaultCloneOrPull;
+    this.cloneOrPull = opts.cloneOrPull ?? defaultFetchAndExtract;
     this.builder = opts.builder ?? buildIndex;
   }
 
@@ -142,35 +122,80 @@ class VaultManager {
   }
 }
 
-async function defaultCloneOrPull(destAbs: string): Promise<string> {
-  // Offline mode for local dev: treat VAULT_CACHE_DIR as a pre-populated
-  // checkout and skip GitHub entirely. Useful for testing against a local
-  // clone without configuring a PAT / App install.
+/**
+ * Fetch the latest commit SHA for the configured branch.
+ */
+async function getLatestSha(owner: string, repo: string, ref: string, token: string): Promise<string> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
+  const res = await fetch(url, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28',
+      'user-agent': 'moltbank-kb-mcp',
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GitHub commits API ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+  const body = (await res.json()) as { sha?: string };
+  if (!body.sha) throw new Error('GitHub commits API returned no sha');
+  return body.sha;
+}
+
+/**
+ * Download and extract the repo tarball for a given ref to `destAbs`.
+ * Uses GitHub's /tarball API (pure HTTP, no git binary required on the host).
+ */
+async function downloadAndExtractTarball(
+  owner: string,
+  repo: string,
+  ref: string,
+  destAbs: string,
+  token: string
+): Promise<void> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/tarball/${encodeURIComponent(ref)}`;
+  const res = await fetch(url, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'user-agent': 'moltbank-kb-mcp',
+    },
+    redirect: 'follow',
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`GitHub tarball API ${res.status}: ${await res.text().catch(() => '')}`);
+  }
+
+  // Fresh extraction — wipe prior cache, recreate dir.
+  await fs.rm(destAbs, { recursive: true, force: true });
+  await fs.mkdir(destAbs, { recursive: true });
+
+  // Web ReadableStream → Node Readable → gunzip → tar extractor.
+  // `strip: 1` removes the top-level directory (e.g. "moltbankhq-moltbank-kb-<sha>/").
+  const nodeReadable = Readable.fromWeb(res.body as unknown as import('stream/web').ReadableStream<Uint8Array>);
+  const extractor = tar.x({ cwd: destAbs, strip: 1 });
+  await pipeline(nodeReadable, createGunzip(), extractor);
+}
+
+async function defaultFetchAndExtract(destAbs: string): Promise<string> {
+  // Offline mode: treat VAULT_CACHE_DIR as a pre-populated checkout.
   if (process.env.VAULT_OFFLINE_MODE === 'true' || process.env.VAULT_OFFLINE_MODE === '1') {
     await fs.mkdir(destAbs, { recursive: true });
     return 'offline-mode';
   }
-  const url = await getAuthedCloneUrl();
-  const br = branch();
-  const gitDirExists = await exists(path.join(destAbs, '.git'));
 
-  const git: SimpleGit = simpleGit();
-  if (!gitDirExists) {
-    // Ensure parent exists
-    await fs.mkdir(path.dirname(destAbs), { recursive: true });
-    // Remove any partial dir
-    if (await exists(destAbs)) await fs.rm(destAbs, { recursive: true, force: true });
-    await git.clone(url, destAbs, ['--depth=1', '--branch', br, '--single-branch']);
-  } else {
-    const repoGit = simpleGit(destAbs);
-    // Reset the origin to use the freshly-minted token (tokens rotate)
-    await repoGit.remote(['set-url', 'origin', url]);
-    await repoGit.fetch(['--depth=1', 'origin', br]);
-    await repoGit.reset(['--hard', `origin/${br}`]);
-  }
+  const slug = repoSlug();
+  const [owner, repo] = slug.split('/');
+  if (!owner || !repo) throw new Error(`Invalid GITHUB_REPO value: ${slug}`);
+  const ref = branch();
+  const token = await resolveAuthToken();
 
-  const repoGit = simpleGit(destAbs);
-  const sha = (await repoGit.revparse(['HEAD'])).trim();
+  // Resolve ref → sha first so the index is tagged with a stable identifier
+  // (tarball URL returns a redirect; the extracted top-dir contains the sha,
+  // but resolving via the commits API is cleaner and one extra cheap call).
+  const sha = await getLatestSha(owner, repo, ref, token);
+  await downloadAndExtractTarball(owner, repo, sha, destAbs, token);
   return sha;
 }
 
@@ -187,3 +212,4 @@ export function __resetVaultManager(opts?: VaultManagerOptions): VaultManager {
   manager = new VaultManager(opts);
   return manager;
 }
+

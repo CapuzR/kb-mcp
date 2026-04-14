@@ -9,6 +9,28 @@ const nextConfig = {
       bodySizeLimit: '2mb',
     },
   },
+  // OAuth 2.0 discovery endpoints live under /.well-known; Next's App Router
+  // doesn't handle dot-prefixed folders cleanly, so we rewrite to clean paths.
+  async rewrites() {
+    return [
+      {
+        source: '/.well-known/oauth-authorization-server',
+        destination: '/api/oauth/authorization-server',
+      },
+      {
+        source: '/.well-known/oauth-protected-resource',
+        destination: '/api/oauth/protected-resource',
+      },
+      {
+        source: '/.well-known/oauth-authorization-server/api/mcp',
+        destination: '/api/oauth/authorization-server',
+      },
+      {
+        source: '/.well-known/oauth-protected-resource/api/mcp',
+        destination: '/api/oauth/protected-resource',
+      },
+    ];
+  },
 };
 
 export default nextConfig;

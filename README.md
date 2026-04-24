@@ -6,7 +6,7 @@ MCP-compatible consumers (Paperclip agents, Mark, Cowork, OpenAI, Claude
 connectors, etc.) via a single HTTPS endpoint with bearer-token auth and
 per-consumer visibility enforcement.
 
-**Status:** production-ready, read-only, hosted on Vercel.
+**Status:** v0.2 adds scoped write tools (`temp_propose_change`) and ops integrations (GA4, Linear). Read path unchanged.
 
 ---
 
@@ -29,8 +29,11 @@ TTL covers the case where the webhook is missed.
 ### Tools
 
 Every tool takes structured JSON (Zod-validated) and returns structured JSON.
-Every tool enforces the caller's `max_visibility` before returning any path or
-content.
+Every tool enforces the caller's scope before it does anything: `max_visibility`
+for read tools, `owner` for write tools, `operations.*` for ops tools.
+Unavailable tools are not registered for a given caller's `tools/list` response.
+
+**vault_** — read-only, gated by `max_visibility`:
 
 - `vault_search` — ranked full-text search (title > heading > body), filters by section/status.
 - `vault_read_file` — read one file by path (path-traversal-safe, visibility-enforced).
@@ -39,6 +42,19 @@ content.
 - `vault_search_todos` — all `[!TODO]` markers, filterable by owner/section.
 - `vault_list_auto_synced` — `maintained_by: agent` files + staleness flag.
 - `vault_get_asset_index` — parsed `wiki/assets/assets-index.md` tables.
+
+**temp_** — write path, gated by `owner` (only four values: `cap|jesus|daniel|marielba`):
+
+- `temp_propose_change` — append a structured proposal to `temp/<owner>.md`. The only file the MCP tool will ever write. Target, type, reason, and content are caller-supplied; the path is derived server-side from `owner`, so cross-file writes are physically impossible through this tool.
+- `temp_list_my_entries` — list the caller's own proposed entries, optionally filtered by status.
+
+**operations_** — live ops data, gated by `operations.ga4` / `operations.linear_read` / `operations.linear_write`:
+
+- `operations_ga4_query` — GA4 `runReport` against property `GA4_PROPERTY_ID`.
+- `operations_linear_search_issues`, `operations_linear_get_issue` — read.
+- `operations_linear_create_issue`, `operations_linear_update_issue` — write.
+
+See [moltbank-kb/wiki/ops/mcp-write-enforcement-plan.md](https://github.com/moltbankhq/moltbank-kb/blob/main/wiki/ops/mcp-write-enforcement-plan.md) for the full rollout plan including the honor-system removal checklist.
 
 ### Visibility tiers
 
@@ -89,12 +105,21 @@ VAULT_OFFLINE_MODE=false
 {
   "tok_paperclip_xxx": { "name": "paperclip-prod",        "max_visibility": "internal", "rate_limit_per_min": 60 },
   "tok_claude_yyy":    { "name": "claude-ai-connector",   "max_visibility": "internal", "rate_limit_per_min": 120 },
-  "tok_cap_zzz":       { "name": "cap-admin",             "max_visibility": "secret",   "rate_limit_per_min": 300 },
+  "tok_cap_zzz":       { "name": "cap-admin",             "max_visibility": "secret",   "rate_limit_per_min": 300, "owner": "cap", "operations": { "ga4": true, "linear_read": true, "linear_write": true } },
+  "tok_daniel_agent":  { "name": "daniel-agent",          "max_visibility": "internal", "rate_limit_per_min": 60,  "owner": "daniel", "operations": { "ga4": true, "linear_read": true, "linear_write": true } },
   "tok_openai_aaa":    { "name": "openai-assistant",      "max_visibility": "internal", "rate_limit_per_min": 120 },
   "tok_hermes_bbb":    { "name": "hermes",                "max_visibility": "internal", "rate_limit_per_min": 120 },
   "tok_pub_www":       { "name": "public-wiki-preview",   "max_visibility": "public",   "rate_limit_per_min": 30 }
 }
 ```
+
+Consumer config fields:
+
+- `name` — human-readable, used in logs.
+- `max_visibility` — `public | internal | secret`. Tier hierarchy, enforced server-side.
+- `rate_limit_per_min` — sliding-window request cap.
+- `owner` (optional) — `cap | jesus | daniel | marielba`. Enables `temp_propose_change` and hard-scopes writes to `temp/<owner>.md`.
+- `operations` (optional) — `{ ga4?: boolean, linear_read?: boolean, linear_write?: boolean }`. Each flag gates a family of `operations_*` tools.
 
 **Generating a token:** any random, URL-safe string works. Recommended:
 `openssl rand -hex 24` and prefix it with something identifying (`tok_<name>_`).

@@ -1,6 +1,6 @@
 {
   "name": "moltbank-kb-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Remote MCP server for the moltbank-kb knowledge vault",
   "scripts": {
@@ -21,7 +21,9 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tar": "^7.4.3",
-    "zod": "^3.24.1"
+    "zod": "^3.24.1",
+    "@google-analytics/data": "^4.10.0",
+    "@linear/sdk": "^29.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",

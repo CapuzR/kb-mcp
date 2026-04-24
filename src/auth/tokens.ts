@@ -2,10 +2,44 @@ import { Visibility, VISIBILITY_TIERS } from '../vault/types';
 import { UnauthorizedError } from '../errors';
 import { isVisibilityTier } from '../vault/visibility';
 
+/**
+ * Team members whose agents can propose wiki changes via temp_propose_change.
+ * A token without an `owner` field is read-only (external integrations like
+ * Paperclip, Claude.ai connector, etc.) and cannot call any write tool.
+ */
+export const OWNER_VALUES = ['cap', 'jesus', 'daniel', 'marielba'] as const;
+export type Owner = (typeof OWNER_VALUES)[number];
+
+export function isOwner(v: unknown): v is Owner {
+  return typeof v === 'string' && (OWNER_VALUES as readonly string[]).includes(v);
+}
+
+/**
+ * Operation-tool scopes. Independently togglable: an agent may have GA4
+ * read-only, Linear read-only, or Linear read+write. `linear_write` implies
+ * `linear_read` logically but is not auto-promoted — the consumer config
+ * must state both if both are wanted.
+ */
+export interface OperationScopes {
+  ga4?: boolean;
+  linear_read?: boolean;
+  linear_write?: boolean;
+}
+
 export interface ConsumerConfig {
   name: string;
   max_visibility: Visibility;
   rate_limit_per_min: number;
+  /**
+   * Team-member identity for write scoping. Required to call
+   * temp_propose_change; the tool will only write to `temp/<owner>.md`.
+   */
+  owner?: Owner;
+  /**
+   * Per-tool operation scopes. Checked in each operations_* tool before
+   * hitting the external service.
+   */
+  operations?: OperationScopes;
 }
 
 export interface ResolvedCaller {
@@ -50,6 +84,8 @@ export function loadTokenMap(envValue: string | undefined = process.env.MCP_TOKE
     const name = v.name;
     const maxVis = v.max_visibility;
     const rateLimit = v.rate_limit_per_min;
+    const owner = v.owner;
+    const operations = v.operations;
 
     if (typeof name !== 'string' || !name) {
       throw new Error(`MCP_TOKENS["${token}"].name must be a non-empty string`);
@@ -62,7 +98,35 @@ export function loadTokenMap(envValue: string | undefined = process.env.MCP_TOKE
     if (typeof rateLimit !== 'number' || !Number.isFinite(rateLimit) || rateLimit <= 0) {
       throw new Error(`MCP_TOKENS["${token}"].rate_limit_per_min must be a positive number`);
     }
-    result[token] = { name, max_visibility: maxVis, rate_limit_per_min: rateLimit };
+
+    const config: ConsumerConfig = { name, max_visibility: maxVis, rate_limit_per_min: rateLimit };
+
+    if (owner !== undefined) {
+      if (!isOwner(owner)) {
+        throw new Error(
+          `MCP_TOKENS["${token}"].owner must be one of ${OWNER_VALUES.join(', ')} (or omitted)`
+        );
+      }
+      config.owner = owner;
+    }
+
+    if (operations !== undefined) {
+      if (!operations || typeof operations !== 'object' || Array.isArray(operations)) {
+        throw new Error(`MCP_TOKENS["${token}"].operations must be an object (or omitted)`);
+      }
+      const ops = operations as Record<string, unknown>;
+      const out: OperationScopes = {};
+      for (const key of ['ga4', 'linear_read', 'linear_write'] as const) {
+        if (ops[key] === undefined) continue;
+        if (typeof ops[key] !== 'boolean') {
+          throw new Error(`MCP_TOKENS["${token}"].operations.${key} must be boolean`);
+        }
+        out[key] = ops[key] as boolean;
+      }
+      config.operations = out;
+    }
+
+    result[token] = config;
   }
 
   cachedMap = result;

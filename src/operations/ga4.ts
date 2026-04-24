@@ -34,15 +34,40 @@ function loadServiceAccountKey(): object {
   if (!raw) {
     throw new AppError('internal', 'GA4_SERVICE_ACCOUNT_KEY is not set', 500);
   }
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new AppError(
-      'internal',
-      `GA4_SERVICE_ACCOUNT_KEY is not valid JSON: ${(err as Error).message}`,
-      500
-    );
+
+  // Be tolerant of how the value ended up in the env var. In practice people
+  // paste the service-account JSON raw, base64-encoded, or wrapped in extra
+  // quotes (Vercel dashboard pastes sometimes do this). Try each in order.
+  let value = raw.trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1);
   }
+
+  // 1. Raw JSON (the documented path).
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object') return parsed as object;
+  } catch {
+    // fall through to base64 attempt
+  }
+
+  // 2. Base64-encoded JSON. People do this to avoid multi-line paste issues.
+  try {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    const parsed = JSON.parse(decoded);
+    if (parsed && typeof parsed === 'object') return parsed as object;
+  } catch {
+    // fall through to error
+  }
+
+  throw new AppError(
+    'internal',
+    'GA4_SERVICE_ACCOUNT_KEY is not valid JSON (tried raw, and base64-decoded). Paste the full service-account .json file contents, or its base64 encoding.',
+    500
+  );
 }
 
 function propertyId(): string {
